@@ -7,6 +7,7 @@ Implement CameraBase with GStreamer, based on PyGST
 
 __all__ = ('CameraPyGst', )
 
+import weakref
 from kivy.clock import Clock
 from kivy.graphics.texture import Texture
 from kivy.core.camera import CameraBase
@@ -62,11 +63,19 @@ class CameraPyGst(CameraBase):
              'name=camerasink emit-signals=True caps=%s'
         self._pipeline = gst.parse_launch(pl % (video_src, GL_CAPS))
         self._camerasink = self._pipeline.get_by_name('camerasink')
-        self._camerasink.connect('new-buffer', self._gst_new_buffer)
+        #
+        # we need to use a weak callback to avoid creating a reference cycle
+        # self -> self._camerasink -> self._gst_new_buffer -> self, which
+        # would prevent the __del__ from being called
+        self._camerasink.connect('new-buffer',
+                                 self._get_weak_callback('_gst_new_buffer'))
         self._decodebin = self._pipeline.get_by_name('decoder')
 
         if self._camerasink and not self.stopped:
             self.start()
+
+    def __del__(self):
+        self.release()
 
     def release(self):
         if self._pipeline is None:
@@ -75,7 +84,21 @@ class CameraPyGst(CameraBase):
         self._pipeline.set_state(gst.STATE_NULL)
         self._pipeline = None
 
-    def _gst_new_buffer(self, *largs):
+    def _get_weak_callback(self, name):
+        import types
+        fn = getattr(self, name)
+        assert type(fn) is types.FunctionType, 'must use a @staticmethod'
+        weakself = weakref.ref(self)
+        def callback(*largs):
+            return fn(weakself, *largs)
+        return callback
+
+    @staticmethod
+    def _gst_new_buffer(weakself, *largs):
+        self = weakself()
+        if self is None:
+            # already gone
+            return
         self._format = 'rgb'
         frame = self._camerasink.emit('pull-buffer')
         if frame is None:
